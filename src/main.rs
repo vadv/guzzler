@@ -16,6 +16,10 @@ struct Args {
     #[arg(long, default_value = "10MB")]
     byte_ram: String,
 
+    /// Number of memory allocation threads (default: 4)
+    #[arg(long, default_value = "4")]
+    memory_thread_count: usize,
+
     /// Path to file for read/write operations in separate thread
     #[arg(long)]
     read_write_filename: Option<String>,
@@ -202,7 +206,8 @@ fn main() {
 
     println!("Guzzler started with:");
     println!("  Tick interval: {:?}", mem_tick_duration);
-    println!("  RAM to consume: {} bytes ({} MB)", ram_bytes, ram_bytes / 1024 / 1024);
+    println!("  Baloon to consume: {} bytes ({} MB)", ram_bytes, ram_bytes / 1024 / 1024);
+    println!("  Memory threads: {}", args.memory_thread_count);
     if let Some(ref filename) = args.read_write_filename {
         println!("  Read/Write file: {}", filename);
         println!("  File size: {} bytes ({} MB)", file_size, file_size / 1024 / 1024);
@@ -260,10 +265,6 @@ fn main() {
     let total_read = Arc::new(Mutex::new(0usize));
     let read_count = Arc::new(Mutex::new(0usize));
 
-    // Клоны для потока выделения памяти
-    let total_allocated_clone = Arc::clone(&total_allocated);
-    let allocation_count_clone = Arc::clone(&allocation_count);
-
     // Клоны для потока чтения диска
     let total_read_clone = Arc::clone(&total_read);
     let read_count_clone = Arc::clone(&read_count);
@@ -315,32 +316,42 @@ fn main() {
         None
     };
 
-    // Поток для выделения памяти
-    let _allocation_thread = thread::spawn(move || {
-        use rand::RngCore;
-        let mut rng = rand::thread_rng();
-        let mut allocated_chunks: Vec<Vec<u8>> = Vec::new();
+    // Потоки для выделения памяти
+    let mut allocation_threads = Vec::new();
+    for _ in 0..args.memory_thread_count {
+        let total_allocated_clone = Arc::clone(&total_allocated);
+        let allocation_count_clone = Arc::clone(&allocation_count);
+        let mem_tick_duration = mem_tick_duration.clone();
+        let ram_bytes = ram_bytes;
 
-        loop {
-            // Выделяем память и заполняем рандомными байтами
-            let mut chunk = vec![0u8; ram_bytes];
-            rng.fill_bytes(&mut chunk);
-            allocated_chunks.push(chunk);
+        let thread_handle = thread::spawn(move || {
+            use rand::RngCore;
+            let mut rng = rand::thread_rng();
+            let mut allocated_chunks: Vec<Vec<u8>> = Vec::new();
 
-            // Обновляем статистику
-            {
-                let mut total = total_allocated_clone.lock().unwrap();
-                *total += ram_bytes;
+            loop {
+                // Выделяем память и заполняем рандомными байтами
+                let mut chunk = vec![0u8; ram_bytes];
+                rng.fill_bytes(&mut chunk);
+                allocated_chunks.push(chunk);
+
+                // Обновляем статистику
+                {
+                    let mut total = total_allocated_clone.lock().unwrap();
+                    *total += ram_bytes;
+                }
+                {
+                    let mut count = allocation_count_clone.lock().unwrap();
+                    *count += 1;
+                }
+
+                // Ждем следующий тик
+                thread::sleep(mem_tick_duration);
             }
-            {
-                let mut count = allocation_count_clone.lock().unwrap();
-                *count += 1;
-            }
+        });
 
-            // Ждем следующий тик
-            thread::sleep(mem_tick_duration);
-        }
-    });
+        allocation_threads.push(thread_handle);
+    }
 
     // Поток для чтения диска (если указан файл)
     let filename_for_disk_read = args.read_write_filename.clone();
@@ -458,10 +469,7 @@ fn main() {
         };
 
         // Получаем RssAnon из /proc/<pid>/status
-        let rss_anon = match get_rss_anon() {
-            Ok(rss) => rss,
-            Err(_) => 0, // Если не удалось получить, используем 0
-        };
+        let rss_anon = get_rss_anon().unwrap_or_else(|_| 0);
 
         // Вычисляем скорость в секунду на основе info_loop_tick_duration
         let period_seconds = info_loop_tick_duration.as_secs_f64();
@@ -479,7 +487,7 @@ fn main() {
 
         if has_file {
             println!(
-                "Time: {:>6.1}s | RAM: {} | Allocs: {:>8} | RAM Speed: {} | Disk Read: {} | Read Speed: {} | Status.Anon: {} | Status.File: {} | Memory.Current: {} | RssAnon: {}",
+                "Time: {:>6.1}s | Baloon: {} | Allocs: {:>8} | Baloon Speed: {} | Disk Read: {} | Read Speed: {} | Status.Anon: {} | Status.File: {} | Memory.Current: {} | RssAnon: {}",
                 elapsed.as_secs_f64(),
                 total_formatted,
                 current_count,
@@ -493,7 +501,7 @@ fn main() {
             );
         } else {
             println!(
-                "Time: {:>6.1}s | RAM: {} | Allocs: {:>8} | RAM Speed: {} | Status.Anon: {} | Status.File: {} | Memory.Current: {} | RssAnon: {}",
+                "Time: {:>6.1}s | Baloon: {} | Allocs: {:>8} | Baloon Speed: {} | Status.Anon: {} | Status.File: {} | Memory.Current: {} | RssAnon: {}",
                 elapsed.as_secs_f64(),
                 total_formatted,
                 current_count,
